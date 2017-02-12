@@ -35,13 +35,7 @@ from gi.repository import GstBase
 from gi.overrides import vfunc
 
 
-
 Gst.init(None)
-
-
-BLENDER_FILEPATH="/home/cfoch/Documents/git/cfoch-blender/simple/simple1.blend"
-SCENE_NAME="Scene"
-OUTPUT_FILEPATH="/home/cfoch/Pictures/blender/"
 
 
 class GstBlenderSrc(GstBase.PushSrc):
@@ -56,7 +50,9 @@ class GstBlenderSrc(GstBase.PushSrc):
     DEFAULT_END_FRAME = 25
     DEFAULT_OUTPUT_LOCATION = "/tmp/"
     DEFAULT_PREFIX = ""
-    DEFAULT_DELETE = False
+    DEFAULT_DELETE = True
+    DEFAULT_FPS_N = 1
+    DEFAULT_FPS_D = 1
 
     __gstmetadata__ = (
         "GstBlenderSrc",
@@ -96,12 +92,20 @@ class GstBlenderSrc(GstBase.PushSrc):
         ),
         "delete": (
             bool, "Delete", "Whether delete the output files or not",
-            DEFAULT_DELETE, GObject.PARAM_READWRITE
-        )
+            DEFAULT_DELETE,
+            GObject.PARAM_READWRITE | GObject.PARAM_STATIC_STRINGS
+        ),
+        # "framerate": (
+        #     Gst.Fraction, "Framerate", "The framerate the scene will playback" \
+        #     "at. Overrides the default scene framerate.", 1, 1, GLib.MAXINT,
+        #     GLib.MAXINT, Gst.Fraction(DEFAULT_FPS_N, DEFAULT_FPS_D),
+        #     GObject.PARAM_READWRITE | GObject.PARAM_STATIC_STRINGS
+        # )
     }
 
     def __init__(self):
         super(GstBase.PushSrc, self).__init__(self)
+        GstBase.BaseSrc.set_format(self, Gst.Format.TIME)
 
         # Properties
         self.location = self.DEFAULT_LOCATION
@@ -110,10 +114,12 @@ class GstBlenderSrc(GstBase.PushSrc):
         self.output_location = self.DEFAULT_OUTPUT_LOCATION
         self.prefix = self.DEFAULT_PREFIX
         self.delete = self.DEFAULT_DELETE
+        self.framerate = Gst.Fraction(self.DEFAULT_FPS_N, self.DEFAULT_FPS_D)
 
         self.index = 1
         # self.is_rendering = False
         self.__is_valid = True
+        self.__duration = None
 
     def do_get_property(self, prop):
         if prop.name == "location":
@@ -128,6 +134,8 @@ class GstBlenderSrc(GstBase.PushSrc):
             return self.prefix
         elif prop.name == "delete":
             return self.delete
+        # elif prop.name == "framerate":
+        #     return self.framerate
         else:
             raise AttributeError('unknown property %s' % prop.name)
 
@@ -155,6 +163,8 @@ class GstBlenderSrc(GstBase.PushSrc):
             self.prefix = value
         elif prop.name == "delete":
             self.detele = value
+        # elif prop.name == "framerate":
+        #     self.framerate= value
         else:
             raise AttributeError('unknown property %s' % prop.name)
 
@@ -163,37 +173,85 @@ class GstBlenderSrc(GstBase.PushSrc):
         # self.is_rendering = False
         print(self.render.frame_path(self.scene.frame_current))
 
-    def update_frame(self):
+    def build_current_filename(self):
         basename = "%s%09d" % (self.prefix, self.index)
         extension = ".png"
         filename = basename + extension
+        return filename
+
+    def build_current_output_path(self):
+        filename = self.build_current_filename()
+        return os.path.join(self.output_location, filename)
+
+    def update_frame(self):
         self.scene.frame_set(self.index)
-        self.render.filepath = os.path.join(self.output_location, filename)
+        self.render.filepath = self.build_current_output_path()
 
     def render_frame(self, animation=False):
-        # self.is_rendering = True
-        bpy.ops.render.render(animation=animation, scene=SCENE_NAME, write_still=True)
+        bpy.ops.render.render(animation=animation, scene="Scene",
+            write_still=True)
 
     def count_frames(self):
-        return self.render.frame_end - self.render.frame_start + 1
+        return self.end_frame - self.start_frame + 1
+
+    def calculate_duration(self):
+        return Gst.util_uint64_scale(Gst.SECOND * self.count_frames(),
+            self.framerate.denom, self.framerate.num)
 
     def read_frame(self):
         path = self.render.filepath
         if not os.path.isfile(path):
             return None
-
         with open(path, "rb") as f:
             data = f.read()
+        if self.delete:
+            os.remove(path)
         return data
+
+    @vfunc(GstBase.BaseSrc)
+    def do_is_seekable(self):
+        if self.__duration is not None:
+            return True
+        return False
+
+    @vfunc(GstBase.BaseSrc)
+    def do_do_seek(self, segment):
+        reverse = segment.rate < 0
+        if reverse:
+            return False
+
+        segment.time = segment.start
+        self.index = self.start_frame + segment.position *\
+            self.framerate.num / (self.framerate.denom * Gst.SECOND)
+        return True
+
+    @vfunc(GstBase.BaseSrc)
+    def do_get_caps(self, filter):
+        return Gst.Caps.new_any()
+
+    @vfunc(GstBase.PushSrc)
+    def do_query(self, query):
+        query.mini_object.refcount -= 1
+        if query.type == Gst.QueryType.DURATION:
+            fmt = query.parse_duration()[0]
+            if fmt == Gst.Format.TIME:
+                if self.__duration is not None:
+                    query.set_duration(fmt, self.__duration)
+                    query.mini_object.refcount += 1
+                return True
+        ret = GstBase.BaseSrc.do_query(self, query)
+        query.mini_object.refcount += 1
+        return ret
 
     @vfunc(GstBase.PushSrc)
     def do_create(self):
-        logging.info("valid to create %r" % self.__is_valid)
         if not self.__is_valid:
             return Gst.FlowReturn.ERROR, None
+
         if self.index > self.end_frame or self.index < self.start_frame:
             return Gst.FlowReturn.EOS, None
 
+        self.__duration = self.calculate_duration()
         self.update_frame()
         self.render_frame()
 
@@ -203,6 +261,15 @@ class GstBlenderSrc(GstBase.PushSrc):
             return Gst.FlowReturn.EOS, None
 
         buff = Gst.Buffer.new_wrapped(data)
+
+        # TODO
+        # Duration shouldn't be double. Check that.
+        duration = Gst.SECOND * self.framerate.denom / self.framerate.num
+
+        buff.pts = (self.index - self.start_frame) * duration
+        buff.duration = duration
+        buff.offset = self.index - self.start_frame
+        buff.offset_end = self.index - self.start_frame + 1
 
         self.index += 1
 
